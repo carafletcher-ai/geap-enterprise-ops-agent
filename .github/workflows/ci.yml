@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write  # for Workload Identity Federation (keyless GCP auth)
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Unit, integration and e2e tests
+        run: python -m pytest -v
+      - name: Golden dataset regression eval (offline)
+        run: python -m evals.offline_eval
+      - name: Secret scan (no hardcoded keys)
+        run: |
+          if grep -RInE "AIza[0-9A-Za-z_-]{35}|ghp_[A-Za-z0-9]{36}|-----BEGIN (RSA )?PRIVATE KEY-----" \
+               --exclude-dir=.git --exclude-dir=tests . ; then
+            echo "Hardcoded secret detected"; exit 1; fi
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - run: terraform -chdir=terraform fmt -check -recursive
+      - run: terraform -chdir=terraform init -backend=false -input=false
+      - run: terraform -chdir=terraform validate
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && vars.GCP_PROJECT_ID != ''
+    needs: [test, terraform]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Terraform IaC + adk deploy agent_engine
+        run: python -m agent_app.deploy --project "${{ vars.GCP_PROJECT_ID }}" --region us-central1 --execute

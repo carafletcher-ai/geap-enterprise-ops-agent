@@ -1,0 +1,57 @@
+# Cloud Build CI/CD: test -> golden eval -> terraform -> adk deploy agent_engine
+# Trigger: gcloud builds submit --config cloudbuild.yaml \
+#            --substitutions=_REGION=us-central1,_ENVIRONMENT=dev
+# Secrets are pulled from Secret Manager via availableSecrets (never inline).
+
+substitutions:
+  _REGION: us-central1
+  _ENVIRONMENT: dev
+  _DISPLAY_NAME: geap-enterprise-ops-agent
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  - id: install-and-test
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q -r requirements-dev.txt
+        python -m pytest -v
+        python -m evals.offline_eval
+
+  - id: terraform
+    name: hashicorp/terraform:1.9
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        terraform -chdir=terraform init -input=false
+        terraform -chdir=terraform validate
+        terraform -chdir=terraform apply -input=false -auto-approve \
+          -var="project_id=$PROJECT_ID" -var="region=${_REGION}" -var="environment=${_ENVIRONMENT}"
+
+  - id: deploy-agent-engine
+    name: python:3.12-slim
+    entrypoint: bash
+    secretEnv: ["ITSM_API_TOKEN"]
+    args:
+      - -c
+      - |
+        pip install -q -r requirements.txt
+        adk deploy agent_engine \
+          --project="$PROJECT_ID" \
+          --region="${_REGION}" \
+          --display_name="${_DISPLAY_NAME}" \
+          --service_account="geap-ops-agent@$PROJECT_ID.iam.gserviceaccount.com" \
+          --trace_to_cloud \
+          agent_app
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/ITSM_API_TOKEN/versions/latest
+      env: ITSM_API_TOKEN
+
+timeout: 2400s
